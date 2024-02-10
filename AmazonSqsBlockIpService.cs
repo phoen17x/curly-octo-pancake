@@ -1,45 +1,40 @@
 using Amazon;
 using Amazon.SQS;
 using Bit.Core.Settings;
+using System;
+using System.Threading.Tasks;
 
 namespace Bit.Core.Services;
 
 public class AmazonSqsBlockIpService : IBlockIpService, IDisposable
 {
     private readonly IAmazonSQS _client;
-    private string _blockIpQueueUrl;
-    private string _unblockIpQueueUrl;
-    private bool _didInit = false;
-    private Tuple<string, bool, DateTime> _lastBlock;
+    private Lazy<Task<(string blockIpQueueUrl, string unblockIpQueueUrl)>> _queueUrls;
+    private BlockedIpInfo _lastBlockedIp;
 
-    public AmazonSqsBlockIpService(
-        GlobalSettings globalSettings)
+    public AmazonSqsBlockIpService(GlobalSettings globalSettings)
         : this(globalSettings, new AmazonSQSClient(
             globalSettings.Amazon.AccessKeyId,
             globalSettings.Amazon.AccessKeySecret,
-            RegionEndpoint.GetBySystemName(globalSettings.Amazon.Region))
-        )
+            RegionEndpoint.GetBySystemName(globalSettings.Amazon.Region)))
     {
     }
 
-    public AmazonSqsBlockIpService(
-        GlobalSettings globalSettings,
-        IAmazonSQS amazonSqs)
+    public AmazonSqsBlockIpService(GlobalSettings globalSettings, IAmazonSQS amazonSqs)
     {
-        if (string.IsNullOrWhiteSpace(globalSettings.Amazon?.AccessKeyId))
-        {
-            throw new ArgumentNullException(nameof(globalSettings.Amazon.AccessKeyId));
-        }
-        if (string.IsNullOrWhiteSpace(globalSettings.Amazon?.AccessKeySecret))
-        {
-            throw new ArgumentNullException(nameof(globalSettings.Amazon.AccessKeySecret));
-        }
-        if (string.IsNullOrWhiteSpace(globalSettings.Amazon?.Region))
-        {
-            throw new ArgumentNullException(nameof(globalSettings.Amazon.Region));
-        }
+        ValidateSettings(globalSettings.Amazon);
+        _client = amazonSqs ?? throw new ArgumentNullException(nameof(amazonSqs));
+        _queueUrls = new Lazy<Task<(string blockIpQueueUrl, string unblockIpQueueUrl)>>(InitAsync);
+    }
 
-        _client = amazonSqs;
+    private static void ValidateSettings(AmazonSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(settings?.AccessKeyId))
+            throw new ArgumentNullException(nameof(settings.AccessKeyId));
+        if (string.IsNullOrWhiteSpace(settings?.AccessKeySecret))
+            throw new ArgumentNullException(nameof(settings.AccessKeySecret));
+        if (string.IsNullOrWhiteSpace(settings?.Region))
+            throw new ArgumentNullException(nameof(settings.Region));
     }
 
     public void Dispose()
@@ -50,32 +45,45 @@ public class AmazonSqsBlockIpService : IBlockIpService, IDisposable
     public async Task BlockIpAsync(string ipAddress, bool permanentBlock)
     {
         var now = DateTime.UtcNow;
-        if (_lastBlock != null && _lastBlock.Item1 == ipAddress && _lastBlock.Item2 == permanentBlock &&
-            (now - _lastBlock.Item3) < TimeSpan.FromMinutes(1))
+        if (_lastBlockedIp?.Matches(ipAddress, permanentBlock, now) ?? false)
         {
-            // Already blocked this IP recently.
-            return;
+            return; // Already blocked this IP recently.
         }
 
-        _lastBlock = new Tuple<string, bool, DateTime>(ipAddress, permanentBlock, now);
-        await _client.SendMessageAsync(_blockIpQueueUrl, ipAddress);
+        _lastBlockedIp = new BlockedIpInfo(ipAddress, permanentBlock, now);
+
+        var (blockIpQueueUrl, unblockIpQueueUrl) = await _queueUrls.Value;
+        await _client.SendMessageAsync(blockIpQueueUrl, ipAddress);
         if (!permanentBlock)
         {
-            await _client.SendMessageAsync(_unblockIpQueueUrl, ipAddress);
+            await _client.SendMessageAsync(unblockIpQueueUrl, ipAddress);
         }
     }
 
-    private async Task InitAsync()
+    private async Task<(string blockIpQueueUrl, string unblockIpQueueUrl)> InitAsync()
     {
-        if (_didInit)
+        var blockIpQueue = await _client.GetQueueUrlAsync("block-ip");
+        var unblockIpQueue = await _client.GetQueueUrlAsync("unblock-ip");
+        return (blockIpQueue.QueueUrl, unblockIpQueue.QueueUrl);
+    }
+
+    private class BlockedIpInfo
+    {
+        public string IpAddress { get; }
+        public bool PermanentBlock { get; }
+        public DateTime BlockTime { get; }
+
+        public BlockedIpInfo(string ipAddress, bool permanentBlock, DateTime blockTime)
         {
-            return;
+            IpAddress = ipAddress;
+            PermanentBlock = permanentBlock;
+            BlockTime = blockTime;
         }
 
-        var blockIpQueue = await _client.GetQueueUrlAsync("block-ip");
-        _blockIpQueueUrl = blockIpQueue.QueueUrl;
-        var unblockIpQueue = await _client.GetQueueUrlAsync("unblock-ip");
-        _unblockIpQueueUrl = unblockIpQueue.QueueUrl;
-        _didInit = true;
+        public bool Matches(string ipAddress, bool permanentBlock, DateTime now)
+        {
+            return IpAddress == ipAddress && PermanentBlock == permanentBlock &&
+                   (now - BlockTime) < TimeSpan.FromMinutes(1);
+        }
     }
 }
